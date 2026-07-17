@@ -1,60 +1,33 @@
 """
-Bot DK Partners - Servidor con webhook (v5)
-- Pide todos los datos de una sola vez
-- Si faltan campos no críticos, avisa y deja elegir si enviar igual o completar
-- Reenvía al jefe con nombre + número del cliente
+Bot DK Partners - Servidor con webhook (v6)
+Flujo conversacional paso a paso (una pregunta a la vez), con reinicio
+automatico por inactividad de 10 minutos.
 """
 
 from flask import Flask, request, jsonify
 import requests
+import time
 from config import ACCESS_TOKEN, PHONE_NUMBER_ID, API_VERSION, VERIFY_TOKEN, NUMERO_JEFE
 
 app = Flask(__name__)
 
-ESPERANDO_DATOS = "esperando_datos"
+TIMEOUT_SEGUNDOS = 10 * 60  # 10 minutos de inactividad -> se reinicia
+
+PREGUNTANDO = "preguntando"
 CONFIRMANDO = "confirmando"
 
 conversaciones = {}
 
-FORMATO_DATOS = (
-    "Nombre: Juan Pérez\n"
-    "Repuesto: Filtro de aceite\n"
-    "Marca: Toyota\n"
-    "Modelo: Hilux\n"
-    "Año: 2019\n"
-    "Placa: ABC-123"
-)
+CAMPOS = [
+    ("nombre", "Para empezar, ¿cuál es tu *nombre*?", "👤"),
+    ("repuesto", "Gracias, {nombre}. ¿Qué *repuesto* estás buscando?", "🔧"),
+    ("marca", "¿Cuál es la *marca* de tu vehículo?", "🚗"),
+    ("modelo", "¿Y el *modelo*?", "📦"),
+    ("año", "¿De qué *año* es? (solo el número, ej. 2019)", "📅"),
+    ("placa", "Por último, ¿cuál es la *placa* del vehículo?", "🔖"),
+]
 
-MENSAJE_BIENVENIDA = (
-    "¡Hola! 👋 Bienvenido a *DK Partners*.\n\n"
-    "Para registrar tu pedido, responde con tus datos en este formato:\n\n"
-    f"{FORMATO_DATOS}\n\n"
-    "Copia el formato, completa tus datos y envíalo 👆"
-)
-
-# Campos mínimos sin los cuales no tiene sentido procesar el pedido
-CAMPOS_MINIMOS = ["repuesto", "marca"]
-
-# Todos los campos ideales
-CAMPOS_TODOS = ["nombre", "repuesto", "marca", "modelo", "año", "placa"]
-
-ALIASES = {
-    "año": ["año", "anio", "anño", "year"],
-    "repuesto": ["repuesto", "parte", "pieza"],
-    "nombre": ["nombre", "name"],
-    "marca": ["marca", "brand"],
-    "modelo": ["modelo", "model"],
-    "placa": ["placa", "plate", "matricula"],
-}
-
-EMOJIS = {
-    "nombre": "👤",
-    "repuesto": "🔧",
-    "marca": "🚗",
-    "modelo": "📦",
-    "año": "📅",
-    "placa": "🔖",
-}
+EMOJIS = {c: e for c, _, e in CAMPOS}
 
 
 def _post(payload):
@@ -96,45 +69,81 @@ def enviar_botones(destinatario, texto, botones):
     })
 
 
-def parsear_datos(texto):
-    datos = {}
-    for linea in texto.strip().split("\n"):
-        if ":" not in linea:
-            continue
-        partes = linea.split(":", 1)
-        clave_raw = partes[0].strip().lower()
-        valor = partes[1].strip()
-        if not valor:
-            continue
-        for campo, aliases in ALIASES.items():
-            if clave_raw in aliases:
-                datos[campo] = valor
-                break
-    return datos
+def validar_campo(nombre_campo, valor):
+    v = (valor or "").strip()
+    if len(v) == 0:
+        return False, "No recibí ningún texto. Intenta de nuevo:"
+    if nombre_campo == "año":
+        if not v.isdigit():
+            return False, "El año debe ser solo números (ej. 2019). Intenta de nuevo:"
+        anio_int = int(v)
+        if anio_int < 1970 or anio_int > 2027:
+            return False, "Ese año no parece válido. Escribe un año entre 1970 y 2027:"
+    elif len(v) < 2:
+        return False, "Esa respuesta es muy corta, ¿puedes darme un poco más de detalle?"
+    return True, None
 
 
 def armar_resumen(datos):
     lineas = []
-    for campo in CAMPOS_TODOS:
+    for campo, _, emoji in CAMPOS:
         if campo in datos:
-            emoji = EMOJIS.get(campo, "•")
             lineas.append(f"{emoji} {campo.capitalize()}: {datos[campo]}")
     return "\n".join(lineas)
 
 
 def armar_mensaje_jefe(numero_cliente, datos):
-    numero_limpio = numero_cliente.replace("@c.us", "")
     resumen = armar_resumen(datos)
-    faltantes = [c for c in CAMPOS_TODOS if c not in datos]
-    nota = ""
-    if faltantes:
-        faltantes_str = ", ".join(c.capitalize() for c in faltantes)
-        nota = f"\n\n⚠️ _Campos no completados: {faltantes_str}_"
     return (
         f"📋 *Nuevo pedido - DK Partners*\n\n"
-        f"📱 Número: +{numero_limpio}\n\n"
+        f"📱 Número: +{numero_cliente}\n\n"
         f"{resumen}"
-        f"{nota}"
+    )
+
+
+def conversacion_activa(numero):
+    estado = conversaciones.get(numero)
+    if estado is None:
+        return None
+    if time.time() - estado["ultima_actividad"] > TIMEOUT_SEGUNDOS:
+        del conversaciones[numero]
+        return None
+    return estado
+
+
+def tocar(numero):
+    if numero in conversaciones:
+        conversaciones[numero]["ultima_actividad"] = time.time()
+
+
+def iniciar_conversacion(numero):
+    conversaciones[numero] = {
+        "paso": 0,
+        "datos": {},
+        "estado": PREGUNTANDO,
+        "ultima_actividad": time.time(),
+    }
+    enviar_texto(
+        numero,
+        "¡Hola! 👋 Bienvenido a *DK Partners*.\n\n"
+        "Soy el asistente virtual y te voy a ayudar a registrar tu pedido "
+        "de repuestos para que uno de nuestros asesores te contacte a la brevedad.\n\n"
+        "Vamos a ir paso a paso, no te preocupes 🙂"
+    )
+    preguntar_paso(numero, 0, {})
+
+
+def preguntar_paso(numero, paso, datos):
+    _, pregunta, _ = CAMPOS[paso]
+    enviar_texto(numero, pregunta.format(**datos))
+
+
+def pedir_confirmacion(numero, datos):
+    resumen = armar_resumen(datos)
+    enviar_botones(
+        numero,
+        f"Perfecto, estos son tus datos:\n\n{resumen}\n\n¿Está todo correcto?",
+        [("btn_confirmar", "✅ Confirmar"), ("btn_corregir", "✏️ Corregir")],
     )
 
 
@@ -159,120 +168,89 @@ def recibir_mensaje():
         mensaje = mensajes[0]
         numero = mensaje["from"]
         tipo = mensaje.get("type")
+
         if tipo == "interactive":
             boton_id = mensaje["interactive"]["button_reply"]["id"]
             manejar_boton(numero, boton_id)
         elif tipo == "text":
             texto = mensaje.get("text", {}).get("body", "").strip()
             manejar_texto(numero, texto)
+
     except (KeyError, IndexError):
         pass
+
     return jsonify(status="ok"), 200
 
 
 def manejar_boton(numero, boton_id):
-    estado = conversaciones.get(numero)
+    estado = conversacion_activa(numero)
 
     if boton_id == "btn_confirmar":
         if not estado or estado["estado"] != CONFIRMANDO:
             return
-        enviar_texto(numero, "✅ ¡Gracias! Tu pedido fue registrado. En breve te contactamos.")
+        enviar_texto(
+            numero,
+            "✅ ¡Gracias! Tu pedido fue registrado correctamente.\n"
+            "Uno de nuestros asesores se pondrá en contacto contigo muy pronto. 🙌"
+        )
         enviar_texto(NUMERO_JEFE, armar_mensaje_jefe(numero, estado["datos"]))
         del conversaciones[numero]
+        return
 
-    elif boton_id == "btn_completar":
-        conversaciones[numero] = {"estado": ESPERANDO_DATOS, "datos": {}}
-        enviar_texto(
-            numero,
-            "Perfecto, vuelve a enviar tus datos completos:\n\n" + FORMATO_DATOS
-        )
-
-    elif boton_id == "btn_corregir":
-        conversaciones[numero] = {"estado": ESPERANDO_DATOS, "datos": {}}
-        enviar_texto(
-            numero,
-            "Sin problema, vuelve a enviar tus datos:\n\n" + FORMATO_DATOS
-        )
-
-    elif boton_id in {"btn_cancelar", "btn_nuevo"}:
-        if numero in conversaciones:
-            del conversaciones[numero]
-        if boton_id == "btn_cancelar":
-            enviar_botones(
-                numero,
-                "Pedido cancelado. ¿Deseas iniciar uno nuevo?",
-                [("btn_nuevo", "🚀 Nuevo pedido")],
-            )
-        else:
-            conversaciones[numero] = {"estado": ESPERANDO_DATOS, "datos": {}}
-            enviar_texto(numero, MENSAJE_BIENVENIDA)
+    if boton_id == "btn_corregir":
+        if not estado:
+            return
+        estado["paso"] = 0
+        estado["datos"] = {}
+        estado["estado"] = PREGUNTANDO
+        tocar(numero)
+        enviar_texto(numero, "Sin problema, empecemos de nuevo:")
+        preguntar_paso(numero, 0, {})
+        return
 
 
 def manejar_texto(numero, texto):
-    texto_lower = texto.lower()
+    estado = conversacion_activa(numero)
+    texto_lower = texto.lower().strip()
 
     if texto_lower in {"cancelar", "salir", "cancel"}:
         if numero in conversaciones:
             del conversaciones[numero]
-        enviar_botones(
-            numero,
-            "Pedido cancelado. ¿Deseas iniciar uno nuevo?",
-            [("btn_nuevo", "🚀 Nuevo pedido")],
-        )
+        enviar_texto(numero, "Tu pedido fue cancelado. Escríbenos cuando quieras iniciar uno nuevo 🙂")
         return
 
-    if numero not in conversaciones:
-        conversaciones[numero] = {"estado": ESPERANDO_DATOS, "datos": {}}
-        enviar_texto(numero, MENSAJE_BIENVENIDA)
+    if estado is None:
+        iniciar_conversacion(numero)
         return
 
-    estado = conversaciones[numero]
+    tocar(numero)
 
-    if estado["estado"] == ESPERANDO_DATOS:
-        datos = parsear_datos(texto)
-        minimos_presentes = all(c in datos for c in CAMPOS_MINIMOS)
+    if estado["estado"] == PREGUNTANDO:
+        paso = estado["paso"]
+        campo_actual = CAMPOS[paso][0]
 
-        if not minimos_presentes:
-            # Sin repuesto ni marca no hay pedido posible
-            faltantes = [c for c in CAMPOS_MINIMOS if c not in datos]
-            faltantes_str = " y ".join(c.capitalize() for c in faltantes)
-            enviar_texto(
-                numero,
-                f"Para procesar tu pedido necesito al menos *{faltantes_str}*.\n\n"
-                f"Vuelve a enviar tus datos:\n\n{FORMATO_DATOS}"
-            )
+        es_valido, error = validar_campo(campo_actual, texto)
+        if not es_valido:
+            enviar_texto(numero, error)
             return
 
-        faltantes = [c for c in CAMPOS_TODOS if c not in datos]
-        estado["datos"] = datos
-        estado["estado"] = CONFIRMANDO
-        resumen = armar_resumen(datos)
+        estado["datos"][campo_actual] = texto.strip()
+        estado["paso"] += 1
 
-        if faltantes:
-            # Tiene lo mínimo pero faltan campos opcionales
-            faltantes_str = ", ".join(c.capitalize() for c in faltantes)
-            enviar_botones(
-                numero,
-                f"Recibí tu pedido:\n\n{resumen}\n\n"
-                f"⚠️ Algunos datos no fueron completados: *{faltantes_str}*.\n\n"
-                "¿Seguro que quieres enviar tu cotización así, o prefieres completar los datos?",
-                [("btn_confirmar", "✅ Enviar así"), ("btn_completar", "✏️ Completar datos")],
-            )
+        if estado["paso"] < len(CAMPOS):
+            preguntar_paso(numero, estado["paso"], estado["datos"])
         else:
-            # Todo completo
-            enviar_botones(
-                numero,
-                f"Estos son tus datos:\n\n{resumen}\n\n¿Todo correcto?",
-                [("btn_confirmar", "✅ Confirmar"), ("btn_corregir", "✏️ Corregir")],
-            )
+            estado["estado"] = CONFIRMANDO
+            pedir_confirmacion(numero, estado["datos"])
         return
 
     if estado["estado"] == CONFIRMANDO:
         enviar_botones(
             numero,
-            "Usa los botones para continuar 👇",
-            [("btn_confirmar", "✅ Confirmar"), ("btn_completar", "✏️ Completar datos")],
+            "Usa los botones para confirmar o corregir tu pedido 👇",
+            [("btn_confirmar", "✅ Confirmar"), ("btn_corregir", "✏️ Corregir")],
         )
+        return
 
 
 if __name__ == "__main__":
