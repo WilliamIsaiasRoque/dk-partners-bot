@@ -222,6 +222,10 @@ def recibir_mensaje():
 
 
 def manejar_boton(numero, boton_id):
+    # El jefe no tiene conversacion de cliente activa, ignoramos botones suyos
+    if numero == NUMERO_JEFE:
+        return
+
     estado = conversacion_activa(numero)
 
     if boton_id == "btn_confirmar":
@@ -255,6 +259,15 @@ def manejar_boton(numero, boton_id):
 
 
 def manejar_texto(numero, texto):
+    # El jefe nunca debe recibir el flujo de cliente si le escribe algo al bot
+    if numero == NUMERO_JEFE:
+        enviar_texto(
+            numero,
+            "👋 Hola, este es el bot de atención a clientes de DK Partners. "
+            "Los pedidos registrados por clientes te llegarán automáticamente aquí."
+        )
+        return
+
     estado = conversacion_activa(numero)
     texto_lower = texto.lower().strip()
 
