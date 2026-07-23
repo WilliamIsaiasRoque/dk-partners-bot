@@ -1,7 +1,10 @@
 """
-Bot DK Partners - Servidor con webhook (v6)
-Flujo conversacional paso a paso (una pregunta a la vez), con reinicio
-automatico por inactividad de 10 minutos.
+Bot DK Partners - Servidor con webhook (v7)
+- Vehiculo (marca+modelo+año) en un solo campo
+- Pregunta de repuestos mas abierta (permite varios)
+- Boton "Corregir" reinicia desde repuestos, no desde el nombre
+- Mensaje final al cliente con datos de contacto de asesores
+- Mensaje al jefe mediante PLANTILLA (requiere plantilla aprobada en Meta)
 """
 
 from flask import Flask, request, jsonify
@@ -18,16 +21,23 @@ CONFIRMANDO = "confirmando"
 
 conversaciones = {}
 
+# Nombre de la plantilla que debes crear y aprobar en WhatsApp Manager
+NOMBRE_PLANTILLA_JEFE = "nuevo_pedido_dk"
+IDIOMA_PLANTILLA = "es"
+
+# Numeros de contacto de asesores (se muestran al cliente al final)
+ASESORES = ["945 133 442", "947 114 330"]
+
 CAMPOS = [
     ("nombre", "Para empezar, ¿cuál es tu *nombre*?", "👤"),
-    ("repuesto", "Gracias, {nombre}. ¿Qué *repuesto* estás buscando?", "🔧"),
-    ("marca", "¿Cuál es la *marca* de tu vehículo?", "🚗"),
-    ("modelo", "¿Y el *modelo*?", "📦"),
-    ("año", "¿De qué *año* es? (solo el número, ej. 2019)", "📅"),
+    ("repuestos", "Gracias, {nombre}. ¿Qué *repuestos* necesitas?", "🔧"),
+    ("vehiculo", "Cuéntame sobre tu vehículo: *marca, modelo y año* (ej. Toyota Hilux 2019)", "🚗"),
     ("placa", "Por último, ¿cuál es la *placa* del vehículo?", "🔖"),
 ]
 
-EMOJIS = {c: e for c, _, e in CAMPOS}
+# Indice del primer campo al que se vuelve cuando el usuario pide "corregir"
+# (0 = nombre, 1 = repuestos). Como el nombre ya se sabe, se vuelve a repuestos.
+PASO_CORRECCION = 1
 
 
 def _post(payload):
@@ -69,17 +79,40 @@ def enviar_botones(destinatario, texto, botones):
     })
 
 
+def enviar_plantilla_jefe(destinatario, numero_cliente, nombre, repuestos, vehiculo, placa):
+    """
+    Manda el resumen del pedido al jefe usando una plantilla aprobada.
+    Necesario porque el jefe nunca le escribe primero al bot (no hay
+    ventana de 24h abierta), asi que un mensaje de texto libre fallaria.
+    """
+    _post({
+        "messaging_product": "whatsapp",
+        "to": destinatario,
+        "type": "template",
+        "template": {
+            "name": NOMBRE_PLANTILLA_JEFE,
+            "language": {"code": IDIOMA_PLANTILLA},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": f"+{numero_cliente}"},
+                        {"type": "text", "text": nombre},
+                        {"type": "text", "text": repuestos},
+                        {"type": "text", "text": vehiculo},
+                        {"type": "text", "text": placa},
+                    ],
+                }
+            ],
+        },
+    })
+
+
 def validar_campo(nombre_campo, valor):
     v = (valor or "").strip()
     if len(v) == 0:
         return False, "No recibí ningún texto. Intenta de nuevo:"
-    if nombre_campo == "año":
-        if not v.isdigit():
-            return False, "El año debe ser solo números (ej. 2019). Intenta de nuevo:"
-        anio_int = int(v)
-        if anio_int < 1970 or anio_int > 2027:
-            return False, "Ese año no parece válido. Escribe un año entre 1970 y 2027:"
-    elif len(v) < 2:
+    if len(v) < 2:
         return False, "Esa respuesta es muy corta, ¿puedes darme un poco más de detalle?"
     return True, None
 
@@ -88,16 +121,22 @@ def armar_resumen(datos):
     lineas = []
     for campo, _, emoji in CAMPOS:
         if campo in datos:
-            lineas.append(f"{emoji} {campo.capitalize()}: {datos[campo]}")
+            etiquetas = {
+                "nombre": "Nombre",
+                "repuestos": "Repuestos",
+                "vehiculo": "Vehículo",
+                "placa": "Placa",
+            }
+            lineas.append(f"{emoji} {etiquetas[campo]}: {datos[campo]}")
     return "\n".join(lineas)
 
 
-def armar_mensaje_jefe(numero_cliente, datos):
-    resumen = armar_resumen(datos)
+def mensaje_final_cliente():
+    contactos = " y ".join(ASESORES)
     return (
-        f"📋 *Nuevo pedido - DK Partners*\n\n"
-        f"📱 Número: +{numero_cliente}\n\n"
-        f"{resumen}"
+        "✅ ¡Gracias! Tu pedido fue registrado correctamente.\n"
+        "Uno de nuestros asesores se pondrá en contacto contigo muy pronto. 🙌\n\n"
+        f"Para más información, comunícate directamente con nuestros asesores: {contactos}"
     )
 
 
@@ -188,24 +227,30 @@ def manejar_boton(numero, boton_id):
     if boton_id == "btn_confirmar":
         if not estado or estado["estado"] != CONFIRMANDO:
             return
-        enviar_texto(
+        datos = estado["datos"]
+        enviar_texto(numero, mensaje_final_cliente())
+        enviar_plantilla_jefe(
+            NUMERO_JEFE,
             numero,
-            "✅ ¡Gracias! Tu pedido fue registrado correctamente.\n"
-            "Uno de nuestros asesores se pondrá en contacto contigo muy pronto. 🙌"
+            datos.get("nombre", ""),
+            datos.get("repuestos", ""),
+            datos.get("vehiculo", ""),
+            datos.get("placa", ""),
         )
-        enviar_texto(NUMERO_JEFE, armar_mensaje_jefe(numero, estado["datos"]))
         del conversaciones[numero]
         return
 
     if boton_id == "btn_corregir":
         if not estado:
             return
-        estado["paso"] = 0
-        estado["datos"] = {}
+        # Vuelve a preguntar desde "repuestos", conserva el nombre ya dado
+        nombre_guardado = estado["datos"].get("nombre", "")
+        estado["datos"] = {"nombre": nombre_guardado} if nombre_guardado else {}
+        estado["paso"] = PASO_CORRECCION
         estado["estado"] = PREGUNTANDO
         tocar(numero)
-        enviar_texto(numero, "Sin problema, empecemos de nuevo:")
-        preguntar_paso(numero, 0, {})
+        enviar_texto(numero, "Sin problema, corrijamos desde aquí:")
+        preguntar_paso(numero, PASO_CORRECCION, estado["datos"])
         return
 
 
